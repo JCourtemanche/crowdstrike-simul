@@ -1,0 +1,16 @@
+# TODO: replace MY_SERVICE with your service name (e.g. cato-simulator, myapi-simulator)
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/MY_SERVICE/MY_SERVICE:latest'
+      - '-f'
+      - 'deployment/Dockerfile'
+      - '.'
+
+images:
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/MY_SERVICE/MY_SERVICE:latest'
+
+substitutions:
+  _REGION: europe-west1
