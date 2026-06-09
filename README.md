@@ -124,93 +124,58 @@ Les générateurs produisent tous les champs requis par le Content Pack :
 
 ---
 
-## Simulateurs existants basés sur ce template
-
-| Projet | API simulée | GitHub |
-|---|---|---|
-| proofpoint-tap-simulator | ProofPoint TAP | [lien](https://github.com/JCourtemanche/proofpoint-tap-simulator) |
-| sentinelone-simul | SentinelOne | [lien](https://github.com/JCourtemanche/sentinelone-simul) |
-| cato-networks-simul | Cato Networks | [lien](https://github.com/JCourtemanche/cato-networks-simul) |
-
-## Checklist de démarrage
-
-### 1. Copier le template
+## Déploiement GCP Cloud Run
 
 ```bash
-# Cloner le template dans un nouveau dossier
-git clone https://github.com/JCourtemanche/xsiam-simulator-template mon-nouveau-simul
-cd mon-nouveau-simul
-
-# Lier à ton nouveau repo GitHub
-git remote set-url origin https://github.com/JCourtemanche/mon-nouveau-simul.git
-```
-
-### 2. Personnaliser les fichiers — dans cet ordre
-
-| Fichier | Quoi changer |
-|---|---|
-| [simulator/config.py](simulator/config.py) | Variables d'env, auth scheme, params spécifiques |
-| [simulator/auth.py](simulator/auth.py) | Garder `require_api_key` ou `require_basic_auth`, supprimer l'autre |
-| [simulator/generators/base.py](simulator/generators/base.py) | Ajouter les helpers spécifiques à ton API |
-| [simulator/generators/example.py](simulator/generators/example.py) | **Renommer** + remplacer les champs par ceux de ton API |
-| [simulator/routes/example.py](simulator/routes/example.py) | **Renommer** + URL, méthode HTTP, paramètres |
-| [simulator/app.py](simulator/app.py) | Nom du service, import des blueprints |
-| [cloudbuild.yaml](cloudbuild.yaml) | Remplacer `MY_SERVICE` |
-| [deploy-cloudrun.sh](deploy-cloudrun.sh) | `SERVICE_NAME`, `REPO_NAME`, env vars |
-| [deployment/app.yaml](deployment/app.yaml) | Variables d'environnement |
-
-Cherche tous les `# TODO:` dans le code pour ne rien oublier :
-```bash
-grep -r "TODO" simulator/ deployment/ *.yaml *.sh
-```
-
-### 3. Tester en local
-
-```bash
-cd simulator
-pip install -r requirements.txt
-python app.py
-# → http://localhost:8080
-```
-
-```bash
-curl http://localhost:8080/health
-curl -H "x-api-key: change-me" http://localhost:8080/api/v1/records
-```
-
-### 4. Déployer sur GCP
-
-```bash
+# Depuis la racine du repo
 bash deploy-cloudrun.sh
 ```
 
-Voir [DEPLOYMENT_GCP.md](DEPLOYMENT_GCP.md) pour le guide complet.
+Le script déploie automatiquement sur `europe-west1` dans le projet GCP actif (`gcloud config get-value project`).
+Voir [DEPLOYMENT_GCP.md](DEPLOYMENT_GCP.md) pour le détail complet.
+
+Pour personnaliser les credentials avant déploiement, modifier les variables dans `deploy-cloudrun.sh` :
+```bash
+# Ligne à modifier dans deploy-cloudrun.sh
+--set-env-vars CLIENT_ID=<votre-id>,CLIENT_SECRET=<votre-secret>,DEBUG=False
+```
 
 ## Structure du projet
 
 ```
 simulator/
-├── app.py                    # Flask app factory — register blueprints here
-├── auth.py                   # Decorators: require_api_key / require_basic_auth
-├── config.py                 # Config class (env vars)
-├── requirements.txt          # Flask + Faker + xsiam-shared-personas
+├── app.py                      # Flask app factory, blueprints, seed data
+├── auth.py                     # OAuth2 Bearer token (émission + validation)
+├── config.py                   # Configuration via variables d'environnement
+├── helpers.py                  # Envelope CrowdStrike, pagination offset + curseur
+├── store.py                    # Données seed en mémoire
+├── requirements.txt
 ├── generators/
-│   ├── base.py               # Shared helpers + persona imports (do not edit imports)
-│   └── example.py            # TODO: rename & replace with your data model
+│   ├── base.py                 # Helpers partagés + imports personas Business Corp
+│   └── crowdstrike.py          # Générateurs : devices, alertes, IOCs, vulns, etc.
 └── routes/
-    └── example.py            # TODO: rename & replace with your API endpoints
+    ├── oauth.py                # POST /oauth2/token
+    ├── devices.py              # Devices + Host Groups
+    ├── alerts.py               # Alertes/Détections + IOM Cloud
+    ├── iocs.py                 # IOCs personnalisés
+    ├── spotlight.py            # Vulnérabilités Spotlight
+    ├── processes.py            # Processus
+    ├── quarantine.py           # Quarantaine
+    ├── cases.py                # Cases
+    ├── exclusions.py           # Exclusions ML + IOA
+    └── rtr.py                  # Real Time Response
 deployment/
-├── Dockerfile                # python:3.11-slim + git + pip install
-└── app.yaml                  # App Engine config (optional)
-cloudbuild.yaml               # GCP Cloud Build
-deploy-cloudrun.sh            # One-command deploy script
+├── Dockerfile                  # python:3.11-slim + gunicorn
+└── app.yaml                    # App Engine config
+cloudbuild.yaml                 # GCP Cloud Build (service: crowdstrike-simul)
+deploy-cloudrun.sh              # Script de déploiement one-command
 ```
 
 ## Personas partagés — Business Corp
 
-Ces données sont fixes et identiques dans tous les simulateurs. **Ne pas modifier ici**, modifier dans [xsiam-shared-personas](https://github.com/JCourtemanche/xsiam-shared-personas).
+Identiques dans tous les simulateurs XSIAM. Source : [xsiam-shared-personas](https://github.com/JCourtemanche/xsiam-shared-personas).
 
-| Utilisateur | Email | Hostname | IP | OS |
+| Utilisateur | Email | Hostname | IP interne | OS |
 |---|---|---|---|---|
 | Alice Dupont | alice.dupont@business.org | BSNS-WIN-ALICE | 192.168.1.1 | Windows 10 Pro |
 | Bob Martin | bob.martin@business.org | BSNS-MAC-BOB | 192.168.1.2 | macOS 13 Ventura |
@@ -218,3 +183,11 @@ Ces données sont fixes et identiques dans tous les simulateurs. **Ne pas modifi
 | David Lefebvre | david.lefebvre@business.org | BSNS-WIN-DAVID | 192.168.1.4 | Windows 10 Pro |
 | Emma Leroy | emma.leroy@business.org | BSNS-MAC-EMMA | 192.168.1.5 | macOS 14 Sonoma |
 | Flora Moreau | flora.moreau@business.org | BSNS-MOB-FLORA | 192.168.1.6 | iOS 17 |
+
+## Autres simulateurs XSIAM
+
+| Projet | API simulée |
+|---|---|
+| [proofpoint-tap-simulator](https://github.com/JCourtemanche/proofpoint-tap-simulator) | ProofPoint TAP |
+| [sentinelone-simul](https://github.com/JCourtemanche/sentinelone-simul) | SentinelOne |
+| [cato-networks-simul](https://github.com/JCourtemanche/cato-networks-simul) | Cato Networks |

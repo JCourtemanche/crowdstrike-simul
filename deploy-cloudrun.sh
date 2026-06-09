@@ -1,5 +1,4 @@
 #!/bin/bash
-# TODO: update SERVICE_NAME and REPO_NAME below before deploying
 # Usage: bash deploy-cloudrun.sh
 
 set -e
@@ -11,9 +10,8 @@ NC='\033[0m'
 
 PROJECT_ID=$(gcloud config get-value project 2>/dev/null)
 REGION="europe-west1"
-# TODO: set your service and artifact registry repo names
-SERVICE_NAME="my-xsiam-simulator"
-REPO_NAME="my-xsiam-simulator"
+SERVICE_NAME="crowdstrike-simul"
+REPO_NAME="crowdstrike-simul"
 
 echo -e "${GREEN}=== Déploiement Cloud Run - $SERVICE_NAME ===${NC}\n"
 echo -e "${YELLOW}Project:${NC} $PROJECT_ID"
@@ -58,7 +56,6 @@ IMAGE_PATH="${REGION}-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/$REPO_NAME:latest"
 echo -e "${GREEN}✓ Image construite: $IMAGE_PATH${NC}\n"
 
 echo -e "${YELLOW}[5/6] Déploiement sur Cloud Run...${NC}"
-# TODO: add your env vars in --set-env-vars
 gcloud run deploy $SERVICE_NAME \
   --image $IMAGE_PATH \
   --platform managed \
@@ -69,7 +66,7 @@ gcloud run deploy $SERVICE_NAME \
   --timeout 300 \
   --min-instances 0 \
   --max-instances 2 \
-  --set-env-vars AUTH_API_KEY=change-me,DEBUG=False
+  --set-env-vars CLIENT_ID=mock-client-id,CLIENT_SECRET=mock-client-secret,DEBUG=False
 
 echo -e "${YELLOW}[6/6] Configuration de l'accès public...${NC}"
 gcloud run services add-iam-policy-binding $SERVICE_NAME \
