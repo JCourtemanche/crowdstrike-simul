@@ -32,8 +32,9 @@ python app.py
 | `NUM_DEVICES` | `20` | Nombre d'endpoints générés |
 | `NUM_ALERTS` | `50` | Nombre de détections générées |
 | `NUM_IOCS` | `30` | Nombre d'IOCs personnalisés |
-| `NUM_VULNERABILITIES` | `40` | Nombre de vulnérabilités Spotlight |
+| `NUM_VULNERABILITIES` | `60` | Nombre de vulnérabilités Spotlight (~10 par sévérité) |
 | `NUM_HOST_GROUPS` | `5` | Nombre de groupes d'hôtes |
+| `NUM_CNAPP_ALERTS` | `25` | Nombre d'alertes CNAPP / Container Security |
 | `PORT` | `8080` | Port du serveur |
 
 ## Authentification — OAuth2 Client Credentials
@@ -89,10 +90,39 @@ curl http://localhost:8080/devices/queries/devices/v1 \
 ### Spotlight (Gestion des vulnérabilités)
 | Méthode | Endpoint | Description |
 |---|---|---|
-| `GET` | `/spotlight/combined/vulnerabilities/v1` | Recherche vulnérabilités (curseur) |
+| `GET` | `/spotlight/combined/vulnerabilities/v1` | Recherche vulnérabilités (curseur, `facet`, filtres FQL — utilisé par `fetch-assets`) |
+
+### Container Security / CNAPP
+| Méthode | Endpoint | Description |
+|---|---|---|
+| `GET` | `/container-security/combined/container-alerts/v1` | Alertes CNAPP (pagination offset/limit, utilisé par `fetch-assets`) |
 
 ### Processus / Quarantaine / Cases / Exclusions / RTR
 Voir la liste complète dans `simulator/routes/`.
+
+## Support de la commande `fetch-assets` (Assets / Exposure / Vulnerabilities)
+
+Le content pack XSIAM (v1.13+) introduit la commande `fetch-assets` qui alimente les modules Assets, Exposure Management et Vulnerabilities via deux flux parallèles :
+
+**1. Flux CNAPP Alerts** — pagination synchrone offset/limit=100 sur `/container-security/combined/container-alerts/v1`.
+Chaque alerte contient : `detection_name`, `detection_description`, `detection_event_simple_name`, `severity`, `first_seen_timestamp`, `last_seen_timestamp`, `containers_impacted_count`, `containers_impacted_ids`, plus l'enrichissement cloud (provider, cluster, namespace, image_repository, image_tag…).
+
+**2. Flux Spotlight Vulnerabilities** — fan-out asynchrone en 6 flux parallèles (`CRITICAL/HIGH/MEDIUM/LOW/NONE/UNKNOWN`).
+Chaque appel envoie :
+```
+GET /spotlight/combined/vulnerabilities/v1
+  ?limit=5000
+  &filter=status:['open','reopen']+cve.severity:['<SEV>']+updated_timestamp:>'now-100d'
+  &facet=host_info&facet=cve
+  &after=<cursor>
+```
+
+Le simulateur reconnaît ces clauses FQL (`status`, `cve.severity`, `updated_timestamp:>'now-Xd'`, `aid`, `cve.id`) et ignore les clauses inconnues. Le param `facet` est accepté mais le mock renvoie systématiquement le document complet (`host_info`, `cve`, `remediation`, `apps[]`). Chaque vulnérabilité expose :
+- `cve` : `id`, `name`, `base_score`, `severity`, `vector`, `impact_score`, `exploitability_score`, `published_date`, `spotlight_published_date`, `remediation_level`, `vendor_advisory`, `cisa_info.is_cisa_kev/due_date`, `actors`
+- `host_info` : `hostname`, `instance_id`, `service_provider`, `service_provider_account_id`, `os_build`, `product_type_desc`, `ou`, `groups[].id/name`, `tags`, `platform`
+- `remediation.entities[]` : `id`, `reference`, `title`, `action`, `link`
+
+**3. Enrichissement Assets** — `POST /devices/entities/devices/v2` avec `{"ids": [aid...]}`. Le mock retourne les 17 champs allowlistés par l'intégration : `device_id`, `cid`, `external_ip`, `mac_address`, `hostname`, `first_seen`, `last_login_timestamp`, `last_seen`, `local_ip`, `machine_domain`, `os_version`, `os_build`, `serial_number`, `status`, `os_product_name`, `connection_mac_address`, `tags`.
 
 ## Format de réponse
 

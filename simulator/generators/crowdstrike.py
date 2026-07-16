@@ -63,9 +63,72 @@ SEVERITIES = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 IOC_TYPES = ["md5", "sha256", "domain", "ipv4", "ipv6", "sha1"]
 IOC_ACTIONS = ["detect", "prevent", "no_action"]
 IOC_PLATFORMS = ["windows", "mac", "linux"]
-CVE_SEVERITIES = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+CVE_SEVERITIES = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE", "UNKNOWN"]
 VULN_STATUSES = ["open", "reopen", "closed"]
 GROUP_TYPES = ["static", "dynamic", "staticByID"]
+
+# ---------------------------------------------------------------------------
+# Cloud / CNAPP taxonomy
+# ---------------------------------------------------------------------------
+CLOUD_PROVIDERS = ["aws", "azure", "gcp"]
+CLOUD_REGIONS = {
+    "aws": ["us-east-1", "us-west-2", "eu-west-1", "eu-central-1"],
+    "azure": ["eastus", "westeurope", "northeurope"],
+    "gcp": ["us-central1", "europe-west1", "asia-east1"],
+}
+CNAPP_CLUSTERS = ["prod-eks-01", "prod-gke-02", "staging-aks-01", "dev-eks-sandbox"]
+CNAPP_NAMESPACES = ["default", "kube-system", "payments", "orders-api", "web-frontend", "data-pipeline"]
+CNAPP_IMAGE_REGISTRIES = ["docker.io", "gcr.io", "quay.io", "public.ecr.aws"]
+CNAPP_IMAGE_REPOS = ["business/api", "business/worker", "nginx", "redis", "postgres", "python", "node"]
+CNAPP_DETECTIONS = [
+    ("Container running as privileged user",
+     "The container was started with --privileged, granting it access to all host devices and capabilities.",
+     "CloudContainerPrivileged"),
+    ("Sensitive host path mounted into container",
+     "A container has mounted a sensitive host path (/var/run/docker.sock, /etc, or /proc), enabling potential host escape.",
+     "CloudSensitiveMount"),
+    ("Cryptomining process detected in container runtime",
+     "A process typical of cryptocurrency mining (xmrig, minerd) was observed executing inside a running container.",
+     "CloudRuntimeCryptomining"),
+    ("Reverse shell process launched from container",
+     "A shell process was spawned with a socket redirected to a remote IP address, consistent with post-exploitation behavior.",
+     "CloudRuntimeReverseShell"),
+    ("Suspicious kubectl exec into production pod",
+     "A kubectl exec session was opened against a production namespace outside of business hours.",
+     "K8sSuspiciousExec"),
+    ("Image with critical vulnerability deployed to production",
+     "A container image containing a known critical CVE was deployed to the production cluster.",
+     "CloudImageCriticalCVE"),
+    ("Public S3 bucket contains sensitive data",
+     "An object storage bucket exposed to the internet contains files matching sensitive data patterns.",
+     "CloudStoragePublicSensitive"),
+    ("IAM role with wildcard permissions attached to workload",
+     "A cloud workload is running with an over-privileged IAM role granting Action:* on Resource:*.",
+     "CloudIAMWildcardPermissions"),
+    ("Container image pulled from untrusted registry",
+     "A pod was scheduled with an image sourced from a registry not on the organization's allowlist.",
+     "CloudImageUntrustedRegistry"),
+    ("Outbound connection to known-malicious IP from container",
+     "A container established an egress connection to an IP address on the threat intelligence blocklist.",
+     "CloudRuntimeMaliciousEgress"),
+]
+CNAPP_SEVERITIES = ["Critical", "High", "Medium", "Low", "Informational"]
+CVE_REMEDIATION_LEVELS = ["O", "T", "W", "U"]  # Official-fix, Temp-fix, Workaround, Unavailable
+CVE_ACTOR_POOL = [
+    "APT28", "APT29", "APT41", "Lazarus", "Silent Ram", "Fancy Bear", "Cozy Bear",
+    "Charming Kitten", "Wizard Spider", "Muddled Libra",
+]
+OS_BUILDS = {
+    "Windows": ["19045", "22000", "22621", "22631", "20348"],
+    "Mac": ["22G120", "23B92", "23C71"],
+    "Linux": ["5.15.0-88-generic", "6.1.0-15-amd64", "4.14.336-256.h539"],
+}
+OS_PRODUCT_NAMES = {
+    "Windows": ["Windows 10 Enterprise", "Windows 10 Pro", "Windows 11 Enterprise", "Windows Server 2019 Datacenter", "Windows Server 2022 Standard"],
+    "Mac": ["macOS Ventura", "macOS Sonoma"],
+    "Linux": ["Amazon Linux 2", "CentOS Linux 7", "Ubuntu Server 22.04 LTS"],
+}
+CLOUD_SERVICE_PROVIDERS = ["AWS_EC2_V2", "Azure", "Google_Cloud_Compute_Engine", "On-Prem"]
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +174,10 @@ def generate_device(device_id: str | None = None) -> dict:
     )
     mac = fake.mac_address().upper().replace(':', '-')
     local_ip = random_internal_ip()
+    last_login = generate_iso8601_date(
+        start_time=datetime.utcnow() - timedelta(days=7),
+        end_time=datetime.utcnow(),
+    )
     return {
         "device_id": device_id,
         "cid": CUSTOMER_ID,
@@ -132,13 +199,17 @@ def generate_device(device_id: str | None = None) -> dict:
         "groups": [],
         "hostname": user['hostname'],
         "kernel_version": f"{random.randint(5, 10)}.{random.randint(0, 15)}.0-generic",
+        "last_login_timestamp": last_login,
         "last_seen": last_seen,
         "local_ip": local_ip,
         "mac_address": mac,
+        "machine_domain": DOMAIN.split('.')[0].upper(),
         "major_version": str(random.randint(6, 10)),
         "meta": {"version": str(random.randint(1, 100)), "version_string": ""},
         "minor_version": str(random.randint(0, 3)),
         "modified_timestamp": last_seen,
+        "os_build": random.choice(OS_BUILDS[platform]),
+        "os_product_name": random.choice(OS_PRODUCT_NAMES[platform]),
         "os_version": os_version,
         "platform_id": str(PLATFORM_NAMES.index(platform)),
         "platform_name": platform,
@@ -331,9 +402,36 @@ def generate_ioc() -> dict:
 # Vulnerability (Spotlight) generator
 # ---------------------------------------------------------------------------
 
-def generate_vulnerability(device: dict) -> dict:
+def generate_vulnerability(device: dict, host_groups: list[dict] | None = None, severity: str | None = None) -> dict:
     cve_id = _cve_id()
-    base_score = round(random.uniform(3.0, 10.0), 1)
+    base_score = round(random.uniform(0.0, 10.0), 1)
+    cve_severity = severity or random.choice(CVE_SEVERITIES)
+    published = generate_iso8601_date(
+        start_time=datetime.utcnow() - timedelta(days=365),
+        end_time=datetime.utcnow() - timedelta(days=30),
+    )
+    spotlight_published = generate_iso8601_date(
+        start_time=datetime.utcnow() - timedelta(days=180),
+        end_time=datetime.utcnow() - timedelta(days=1),
+    )
+    is_kev = random.random() < 0.15
+    kev_due_date = (
+        (datetime.utcnow() + timedelta(days=random.randint(7, 60))).strftime('%Y-%m-%d')
+        if is_kev else ""
+    )
+    actors = random.sample(CVE_ACTOR_POOL, k=random.randint(0, 2))
+
+    # Pick 0–2 real host_groups for this host (falls back to empty when none seeded)
+    device_group_ids = device.get('groups') or []
+    resolved_groups = []
+    if host_groups:
+        by_id = {g['id']: g for g in host_groups}
+        for gid in device_group_ids[:3]:
+            g = by_id.get(gid)
+            if g:
+                resolved_groups.append({"id": g['id'], "name": g['name']})
+
+    provider = random.choice(CLOUD_SERVICE_PROVIDERS)
     return {
         "id": str(uuid.uuid4()),
         "cid": CUSTOMER_ID,
@@ -342,7 +440,10 @@ def generate_vulnerability(device: dict) -> dict:
             start_time=datetime.utcnow() - timedelta(days=60),
             end_time=datetime.utcnow() - timedelta(days=1),
         ),
-        "updated_timestamp": generate_iso8601_date(),
+        "updated_timestamp": generate_iso8601_date(
+            start_time=datetime.utcnow() - timedelta(days=7),
+            end_time=datetime.utcnow(),
+        ),
         "status": random.choice(VULN_STATUSES),
         "apps": [
             {
@@ -358,31 +459,52 @@ def generate_vulnerability(device: dict) -> dict:
         ],
         "cve": {
             "id": cve_id,
+            "name": f"Remote Code Execution in {fake.company()} Product",
             "base_score": base_score,
-            "severity": random.choice(CVE_SEVERITIES),
+            "severity": cve_severity,
             "exploit_status": random.randint(0, 50),
             "exprt_rating": random.choice(CVE_SEVERITIES),
-            "description": f"A vulnerability in software component allows attackers to execute arbitrary code.",
-            "published_date": generate_iso8601_date(
-                start_time=datetime.utcnow() - timedelta(days=365),
-                end_time=datetime.utcnow() - timedelta(days=30),
+            "description": (
+                f"A vulnerability in a software component allows a remote attacker to "
+                f"execute arbitrary code by sending a specially crafted request. "
+                f"Successful exploitation could lead to full system compromise."
             ),
+            "published_date": published,
+            "spotlight_published_date": spotlight_published,
             "impact_score": round(random.uniform(1.0, 10.0), 1),
             "exploitability_score": round(random.uniform(1.0, 10.0), 1),
+            "remediation_level": random.choice(CVE_REMEDIATION_LEVELS),
+            "vendor_advisory": f"https://vendor.example.com/security/advisories/{cve_id}",
             "vector": random.choice([
                 "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
                 "CVSS:3.1/AV:L/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H",
                 "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:H/I:H/A:H",
             ]),
+            "cisa_info": {
+                "is_cisa_kev": is_kev,
+                "due_date": kev_due_date,
+            },
+            "actors": actors,
         },
         "host_info": {
             "hostname": device['hostname'],
+            "instance_id": f"i-{uuid.uuid4().hex[:17]}" if provider != "On-Prem" else "",
+            "service_provider": provider,
+            "service_provider_account_id": (
+                str(random.randint(100000000000, 999999999999)) if provider != "On-Prem" else ""
+            ),
             "local_ip": device['local_ip'],
             "machine_domain": DOMAIN.split('.')[0].upper(),
+            "os_build": device.get('os_build', ''),
             "os_version": device['os_version'],
+            "ou": random.choice(["Corporate/Endpoints", "Corporate/Servers", "Cloud/EKS", "Cloud/AKS"]),
+            "product_type_desc": device.get('product_type_desc', 'Workstation'),
+            "platform": device['platform_name'],
             "platform_name": device['platform_name'],
             "site_name": "Default",
             "system_manufacturer": device['system_manufacturer'],
+            "groups": resolved_groups,
+            "tags": [],
         },
         "remediation": {
             "entities": [
@@ -425,6 +547,64 @@ def generate_host_group(group_id: str | None = None) -> dict:
         "created_timestamp": ts,
         "modified_by": random_user()['email'],
         "modified_timestamp": ts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CNAPP / Container-Security alert generator
+# ---------------------------------------------------------------------------
+
+def _container_id():
+    return uuid.uuid4().hex
+
+
+def generate_cnapp_alert() -> dict:
+    detection_name, description, event_simple_name = random.choice(CNAPP_DETECTIONS)
+    provider = random.choice(CLOUD_PROVIDERS)
+    region = random.choice(CLOUD_REGIONS[provider])
+    cluster = random.choice(CNAPP_CLUSTERS)
+    namespace = random.choice(CNAPP_NAMESPACES)
+    registry = random.choice(CNAPP_IMAGE_REGISTRIES)
+    repo = random.choice(CNAPP_IMAGE_REPOS)
+    tag = random.choice(["latest", "v1.2.3", "v2.0.0-rc1", "stable", "prod-2026-07"])
+    impacted_count = random.randint(1, 8)
+    container_ids = [_container_id() for _ in range(impacted_count)]
+    first_seen = generate_iso8601_date(
+        start_time=datetime.utcnow() - timedelta(days=14),
+        end_time=datetime.utcnow() - timedelta(hours=1),
+    )
+    last_seen = generate_iso8601_date(
+        start_time=datetime.utcnow() - timedelta(hours=1),
+        end_time=datetime.utcnow(),
+    )
+    account_id = (
+        str(random.randint(100000000000, 999999999999)) if provider == "aws"
+        else f"{provider}-subscription-{uuid.uuid4().hex[:12]}"
+    )
+    return {
+        "id": str(uuid.uuid4()),
+        "cid": CUSTOMER_ID,
+        "detection_name": detection_name,
+        "detection_description": description,
+        "detection_event_simple_name": event_simple_name,
+        "severity": random.choice(CNAPP_SEVERITIES),
+        "first_seen_timestamp": first_seen,
+        "last_seen_timestamp": last_seen,
+        "containers_impacted_count": str(impacted_count),
+        "containers_impacted_ids": container_ids,
+        # Context enrichment fields (realistic, non-schema)
+        "cloud_provider": provider,
+        "cloud_region": region,
+        "cloud_account_id": account_id,
+        "cluster_name": cluster,
+        "namespace": namespace,
+        "image_id": generate_sha256(),
+        "image_registry": registry,
+        "image_repository": repo,
+        "image_tag": tag,
+        "image_digest": f"sha256:{generate_sha256()}",
+        "resource_type": random.choice(["Pod", "Container", "Node", "CloudFunction"]),
+        "resource_id": f"{cluster}/{namespace}/{uuid.uuid4().hex[:8]}",
     }
 
 

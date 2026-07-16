@@ -17,6 +17,7 @@ from routes.quarantine import quarantine_bp
 from routes.cases import cases_bp
 from routes.exclusions import exclusions_bp
 from routes.rtr import rtr_bp
+from routes.container_security import container_security_bp
 
 
 def create_app():
@@ -34,7 +35,7 @@ def create_app():
     logger.info(
         f"Seeded: {len(store.devices)} devices, {len(store.alerts)} alerts, "
         f"{len(store.iocs)} IOCs, {len(store.vulnerabilities)} vulnerabilities, "
-        f"{len(store.host_groups)} host groups"
+        f"{len(store.host_groups)} host groups, {len(store.cnapp_alerts)} CNAPP alerts"
     )
 
     # Register blueprints
@@ -48,6 +49,7 @@ def create_app():
     app.register_blueprint(cases_bp)
     app.register_blueprint(exclusions_bp)
     app.register_blueprint(rtr_bp)
+    app.register_blueprint(container_security_bp)
 
     @app.route('/health', methods=['GET'])
     def health():
@@ -61,6 +63,7 @@ def create_app():
                 'iocs': len(store.iocs),
                 'vulnerabilities': len(store.vulnerabilities),
                 'host_groups': len(store.host_groups),
+                'cnapp_alerts': len(store.cnapp_alerts),
             },
         }), 200
 
@@ -83,7 +86,8 @@ def create_app():
                 'PATCH /alerts/entities/alerts/v3': 'Update alerts',
                 'GET /iocs/combined/indicator/v1': 'Search custom IOCs',
                 'POST /iocs/entities/indicators/v1': 'Create IOC',
-                'GET /spotlight/combined/vulnerabilities/v1': 'Search vulnerabilities',
+                'GET /spotlight/combined/vulnerabilities/v1': 'Search vulnerabilities (facet + FQL filter, cursor pagination — used by fetch-assets)',
+                'GET /container-security/combined/container-alerts/v1': 'List CNAPP alerts (used by fetch-assets CNAPP track)',
                 'GET /processes/entities/processes/v1': 'Get process details',
                 'GET /quarantine/queries/quarantined-files/v1': 'Query quarantined files',
                 'GET /health': 'Health check',

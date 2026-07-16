@@ -16,5 +16,6 @@ class Config:
     NUM_DEVICES = int(os.environ.get('NUM_DEVICES', 20))
     NUM_ALERTS = int(os.environ.get('NUM_ALERTS', 50))
     NUM_IOCS = int(os.environ.get('NUM_IOCS', 30))
-    NUM_VULNERABILITIES = int(os.environ.get('NUM_VULNERABILITIES', 40))
+    NUM_VULNERABILITIES = int(os.environ.get('NUM_VULNERABILITIES', 60))
     NUM_HOST_GROUPS = int(os.environ.get('NUM_HOST_GROUPS', 5))
+    NUM_CNAPP_ALERTS = int(os.environ.get('NUM_CNAPP_ALERTS', 25))
