@@ -26,11 +26,15 @@ def cs_response(resources, total: int | None = None, offset: int = 0, limit: int
 
 
 def cs_error(code: int, message: str, http_status: int = 400):
-    return {
+    """Build a CrowdStrike error envelope + HTTP status as a Flask return tuple.
+    Callers use `return cs_error(...)` (no jsonify wrap).
+    """
+    from flask import jsonify
+    return jsonify({
         "meta": {"query_time": 0.001, "trace_id": str(uuid.uuid4())},
         "errors": [{"code": code, "message": message}],
         "resources": [],
-    }, http_status
+    }), http_status
 
 
 def paginate(items: list, offset: int, limit: int) -> tuple[list, int]:

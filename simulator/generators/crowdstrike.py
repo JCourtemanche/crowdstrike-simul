@@ -136,7 +136,12 @@ CLOUD_SERVICE_PROVIDERS = ["AWS_EC2_V2", "Azure", "Google_Cloud_Compute_Engine",
 # ---------------------------------------------------------------------------
 
 def _device_id():
-    return uuid.uuid4().hex[:32]
+    # NOT uuid.uuid4() — that uses os.urandom and is not deterministic even
+    # when random.seed() is called. This uses stdlib random, so bootstrap
+    # with a fixed Config.SEED produces the same device_ids across every
+    # instance / restart. Required for multi-instance consistency on Cloud
+    # Run (fetch-assets otherwise fails to enrich cross-instance AIDs).
+    return f"{random.getrandbits(128):032x}"
 
 
 def _detection_id(device_id: str):
@@ -525,7 +530,8 @@ def generate_vulnerability(device: dict, host_groups: list[dict] | None = None, 
 # ---------------------------------------------------------------------------
 
 def generate_host_group(group_id: str | None = None) -> dict:
-    group_id = group_id or str(uuid.uuid4()).replace('-', '')[:16]
+    # Deterministic (see _device_id note).
+    group_id = group_id or f"{random.getrandbits(64):016x}"
     group_type = random.choice(GROUP_TYPES)
     ts = generate_iso8601_date(
         start_time=datetime.utcnow() - timedelta(days=180),
@@ -555,7 +561,17 @@ def generate_host_group(group_id: str | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 def _container_id():
-    return uuid.uuid4().hex
+    # Deterministic (see _device_id note) — CNAPP alerts and their
+    # containers_impacted_ids should also be stable across Cloud Run
+    # instances so XSIAM doesn't see duplicate rows on re-ingestion.
+    return f"{random.getrandbits(128):032x}"
+
+
+def _alert_uuid():
+    """Deterministic UUID-shaped string for CNAPP alert `id` / `image_digest`."""
+    rb = random.getrandbits(128).to_bytes(16, 'big')
+    hx = rb.hex()
+    return f"{hx[:8]}-{hx[8:12]}-{hx[12:16]}-{hx[16:20]}-{hx[20:]}"
 
 
 def generate_cnapp_alert() -> dict:
@@ -582,7 +598,7 @@ def generate_cnapp_alert() -> dict:
         else f"{provider}-subscription-{uuid.uuid4().hex[:12]}"
     )
     return {
-        "id": str(uuid.uuid4()),
+        "id": _alert_uuid(),
         "cid": CUSTOMER_ID,
         "detection_name": detection_name,
         "detection_description": description,
@@ -604,7 +620,7 @@ def generate_cnapp_alert() -> dict:
         "image_tag": tag,
         "image_digest": f"sha256:{generate_sha256()}",
         "resource_type": random.choice(["Pod", "Container", "Node", "CloudFunction"]),
-        "resource_id": f"{cluster}/{namespace}/{uuid.uuid4().hex[:8]}",
+        "resource_id": f"{cluster}/{namespace}/{random.getrandbits(32):08x}",
     }
 
 

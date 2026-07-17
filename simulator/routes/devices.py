@@ -56,15 +56,29 @@ def query_device_ids():
 @require_bearer
 def get_device_details():
     if request.method == 'POST':
-        ids = request.json.get('ids', []) if request.is_json else []
+        body = request.get_json(silent=True) or {}
+        ids = body.get('ids') or []
     else:
         ids = request.args.getlist('ids')
 
     if not ids:
-        return jsonify(cs_error(400, "ids parameter is required")), 400
+        return cs_error(400, "ids parameter is required")
 
     resources = [store.device_by_id[did] for did in ids if did in store.device_by_id]
-    return jsonify(cs_response(resources, total=len(resources))), 200
+    unknown = [did for did in ids if did not in store.device_by_id]
+
+    envelope = cs_response(resources, total=len(resources))
+    # Match CS API contract: unknown ids land in errors[] rather than being
+    # silently dropped. The fetch-assets client uses ok_codes=(200, 400)
+    # and reads response.errors — this defensive path prevents an empty
+    # `resources` from causing enrich_and_ingest_batch to early-return
+    # and skip the assets seal batch.
+    if unknown:
+        envelope['errors'] = [
+            {"code": 404, "message": f"Device {did} not found", "id": did}
+            for did in unknown
+        ]
+    return jsonify(envelope), 200
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +171,7 @@ def update_host_group():
         if g['id'] == group_id:
             g.update({k: v for k, v in body.items() if k in ('name', 'description', 'assignment_rule')})
             return jsonify(cs_response([g], total=1)), 200
-    return jsonify(cs_error(404, f"Group {group_id} not found", 404)), 404
+    return cs_error(404, f"Group {group_id} not found", 404)
 
 
 @devices_bp.route('/devices/entities/host-groups/v1', methods=['DELETE'])

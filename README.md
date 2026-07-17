@@ -35,6 +35,7 @@ python app.py
 | `NUM_VULNERABILITIES` | `60` | Nombre de vulnérabilités Spotlight (~10 par sévérité) |
 | `NUM_HOST_GROUPS` | `5` | Nombre de groupes d'hôtes |
 | `NUM_CNAPP_ALERTS` | `25` | Nombre d'alertes CNAPP / Container Security |
+| `SEED` | `42` | Seed déterministe du bootstrap (voir section Cloud Run ci-dessous) |
 | `PORT` | `8080` | Port du serveur |
 
 ## Authentification — OAuth2 Client Credentials
@@ -153,6 +154,14 @@ Les générateurs produisent tous les champs requis par le Content Pack :
 - **Host Groups** : tous les champs de `HOST_GROUP_HEADERS` (id, name, group_type, description, assignment_rule, created_by, created_timestamp…)
 
 ---
+
+## Cohérence multi-instances (Cloud Run)
+
+Le bootstrap est **déterministe** (contrôlé par `SEED`, défaut `42`) : chaque instance qui démarre avec le même seed génère des `device_id`, `host_group.id`, `aid` de vulns et `id` d'alertes CNAPP **identiques au bit près**.
+
+C'est essentiel pour la commande `fetch-assets`. Cette commande fan-out 6 requêtes parallèles par sévérité vers `/spotlight/combined/vulnerabilities/v1`, puis envoie tous les AIDs collectés en un seul batch `POST /devices/entities/devices/v2` pour enrichissement. Sur Cloud Run, ces requêtes peuvent être routées vers **plusieurs instances concurrentes**. Sans seed déterministe, chaque instance générerait des `device_id` différents à son démarrage → les AIDs de l'instance A ne matcheraient pas les devices de l'instance B → le POST d'enrichissement retournerait `resources: []` → le client (`AssetsDeviceHandler.enrich_and_ingest_batch`) sort silencieusement **sans envoyer le seal batch** → le snapshot `Falcon_Spotlight_Assets` ne se ferme jamais sur XSIAM → **dataset `crowdstrike_falcon_spotlight_assets_raw` reste vide** (alors que `crowdstrike_falcon_spotlight_vulnerabilities_raw` se remplit correctement via les batches intermédiaires).
+
+Avec le seed déterministe activé (comportement par défaut), toutes les instances Cloud Run sont interchangeables et le flow fetch-assets converge correctement.
 
 ## Déploiement GCP Cloud Run
 

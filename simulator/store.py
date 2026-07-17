@@ -1,7 +1,15 @@
 """
 In-memory seed data store. Populated once at startup.
+
+Bootstrap is DETERMINISTIC (seeded from Config.SEED). Multiple concurrent
+instances of this mock (e.g. Cloud Run autoscaling) produce byte-identical
+seed data, so an AID collected from one instance always resolves against
+another instance — required for the fetch-assets flow to close its
+Falcon_Spotlight_Assets snapshot.
 """
 import random
+
+from faker import Faker
 
 from config import Config
 from generators.crowdstrike import (
@@ -33,6 +41,10 @@ ioc_by_id: dict[str, dict] = {}
 def bootstrap():
     global devices, alerts, iocs, vulnerabilities, host_groups, processes, cnapp_alerts
     global device_by_id, alert_by_id, ioc_by_id
+
+    # 0) Seed both stdlib random and Faker for cross-instance determinism.
+    random.seed(Config.SEED)
+    Faker.seed(Config.SEED)
 
     # 1) Host groups first — vulnerability host_info.groups refers to them
     host_groups = [generate_host_group() for _ in range(Config.NUM_HOST_GROUPS)]
