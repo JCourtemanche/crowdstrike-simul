@@ -1,0 +1,745 @@
+args:
+- description: Cortex XSIAM tenant API base URL (e.g. https://api-<tenant>.xdr.<region>.paloaltonetworks.com)
+  name: api_url
+  required: true
+  supportedModules: []
+- description: Cortex XSIAM API key value
+  name: api_key
+  required: true
+  secret: true
+  supportedModules: []
+- description: Cortex XSIAM API key ID (integer, sent as the x-xdr-auth-id header)
+  name: api_key_id
+  required: true
+  supportedModules: []
+- description: 'XQL query time frame: ''7 days'', ''24 hours'', ''1 week''...'
+  name: time_frame
+  defaultValue: 7 days
+  supportedModules: []
+- description: Source dataset to read from
+  name: dataset
+  defaultValue: crowdstrike_falcon_spotlight_vulnerabilities_raw
+  supportedModules: []
+- description: Optional extra XQL filter expression appended to the query, e.g. "json_extract_scalar(cve, '$.severity') = 'CRITICAL'"
+  name: extra_xql_filter
+  supportedModules: []
+- description: Max XQL rows returned in a single query
+  name: xql_limit
+  defaultValue: '10000'
+  supportedModules: []
+- description: Max seconds to wait for XQL results
+  name: xql_timeout
+  defaultValue: '120'
+  supportedModules: []
+- description: Number of assets per BYOS submit request
+  name: batch_size
+  defaultValue: '100'
+  supportedModules: []
+- description: If true, build the payload but do not POST to Cortex
+  name: dry_run
+  auto: PREDEFINED
+  predefined:
+  - 'true'
+  - 'false'
+  defaultValue: 'false'
+  supportedModules: []
+- description: Verify the Cortex API TLS certificate
+  name: verify
+  auto: PREDEFINED
+  predefined:
+  - 'true'
+  - 'false'
+  defaultValue: 'true'
+  supportedModules: []
+- description: After posting to BYOS, poll each returned job_id until terminal status
+  name: poll_after_submit
+  auto: PREDEFINED
+  predefined:
+  - 'true'
+  - 'false'
+  defaultValue: 'true'
+  supportedModules: []
+- description: Max seconds to wait for each job to reach a terminal status
+  name: poll_timeout
+  defaultValue: '180'
+  supportedModules: []
+- description: Initial delay between polls, backs off up to 30s
+  name: poll_interval
+  defaultValue: '5'
+  supportedModules: []
+- description: 'STANDALONE MODE: if set, skip the whole XQL/submit flow and just report the current status of the given BYOS job. Requires api_url + api_key + api_key_id.'
+  name: poll_job_id
+  supportedModules: []
+commonfields:
+  id: cddccdcd-1234-4567-89ab-cdef01234567
+  version: -1
+comment: Import CrowdStrike Falcon Spotlight vulnerabilities from the XSIAM dataset directly (via XQL) into Cortex Exposure Management via BYOS. Aggregates rows by asset, then POSTs to /public_api/vulnerability-management/v1/external-scans/assets
+  in batches.
+dockerimage: demisto/python3:3.12.13.10404775
+enabled: true
+engineinfo: {}
+mainengineinfo: {}
+name: CrowdStrikeBYOSImporter
+outputs:
+- contextPath: CrowdStrike.BYOS.assets_count
+  description: Number of assets submitted to BYOS
+  type: number
+- contextPath: CrowdStrike.BYOS.vulnerabilities_count
+  description: Number of vulnerabilities submitted to BYOS
+  type: number
+- contextPath: CrowdStrike.BYOS.xql_rows
+  description: Raw row count returned by the XQL query
+  type: number
+- contextPath: CrowdStrike.BYOS.jobs
+  description: Per-batch submit responses, each enriched with poll_result if auto-poll ran
+  type: unknown
+- contextPath: CrowdStrike.BYOS.poll_summary
+  description: Aggregate counts by terminal status across all polled jobs
+  type: unknown
+- contextPath: CrowdStrike.BYOS.Poll.job_id
+  description: 'Standalone poll: job id being reported'
+  type: string
+- contextPath: CrowdStrike.BYOS.Poll.job_status
+  description: 'Standalone poll: terminal status or last non-terminal one at timeout'
+  type: string
+- contextPath: CrowdStrike.BYOS.Poll.poll_attempts
+  description: 'Standalone poll: number of poll requests made'
+  type: number
+- contextPath: CrowdStrike.BYOS.Poll.poll_elapsed_seconds
+  description: 'Standalone poll: seconds spent polling'
+  type: number
+- contextPath: CrowdStrike.BYOS.Poll.error_log
+  description: 'Standalone poll: BYOS error_log if any'
+  type: string
+pswd: ''
+restrictioncenter: {}
+runas: DBotWeakRole
+runonce: false
+script: |
+  """
+  CrowdStrike Falcon Spotlight -> Cortex XSIAM Exposure Management (BYOS)
+
+  XSIAM Automation Script.
+
+  Design
+  ------
+  Reads the vulnerabilities that the CrowdStrike Falcon integration has already
+  pushed into the `crowdstrike_falcon_spotlight_vulnerabilities_raw` dataset
+  (via XQL), aggregates them by asset, then POSTs to the BYOS submit endpoint.
+
+  Why XQL instead of calling the CrowdStrike integration commands (like the
+  Cyberwatch importer does):
+    1. The Spotlight dataset row already carries `host_info` (hostname, IP, OS,
+       platform, groups) alongside the CVE - no extra call needed.
+    2. XQL is scale-friendly (millions of rows); direct Falcon API pagination
+       is not.
+    3. No dependency on the CrowdStrike integration being installed and
+       configured on the tenant.
+
+  Flow
+  ----
+  1. Start an XQL query on the vulnerabilities dataset with the requested
+     time_frame and optional filter.
+  2. Poll `get_query_results` until status = SUCCESS or PARTIAL_SUCCESS.
+  3. Aggregate rows by asset (Falcon `aid`) -> one BYOS asset entry with N
+     vulnerabilities.
+  4. POST the payload in batches to
+     `POST /public_api/vulnerability-management/v1/external-scans/assets`.
+  5. Auto-poll each returned `job_id` via
+     `GET /public_api/vulnerability-management/v1/external-scans/assets/jobs/<id>`
+     until a terminal state (COMPLETED / COMPLETED_WITH_ERRORS / FAILED) or a
+     configurable timeout. Toggle off with poll_after_submit=false.
+
+  Standalone poll mode: pass `poll_job_id=<id>` and the script skips the whole
+  XQL/submit flow and just reports the current status of that job.
+
+  XSIAM API references:
+    https://docs-cortex.paloaltonetworks.com/r/Cortex-XSIAM-Platform-APIs/Submit-assets-and-vulnerabilities-from-an-external-scanner
+    https://docs-cortex.paloaltonetworks.com/r/Cortex-XSIAM-Platform-APIs/Poll-the-status-of-a-BYOS-import-job
+    https://docs-cortex.paloaltonetworks.com/r/Cortex-XSIAM-Platform-APIs/Start-an-XQL-query
+    https://docs-cortex.paloaltonetworks.com/r/Cortex-XSIAM-Platform-APIs/Get-XQL-query-results
+  """
+  from CommonServerPython import *  # noqa: F401,F403
+
+  import json
+  import time
+  from datetime import datetime, timedelta, timezone
+  from typing import Any
+
+
+  VENDOR = "CrowdStrike"
+  PRODUCT = "Falcon Spotlight"
+  VERSION = "1.0"
+
+  # Bumped every time the payload logic changes. Printed at startup so we can
+  # tell from the war-room / logs which version XSIAM is running.
+  SCRIPT_VERSION = "1.0.0"
+
+  BYOS_SUBMIT_PATH = "/public_api/vulnerability-management/v1/external-scans/assets"
+  BYOS_JOB_PATH = "/public_api/vulnerability-management/v1/external-scans/assets/jobs"
+
+  XQL_START_PATH = "/public_api/v1/xql/start_xql_query"
+  XQL_RESULTS_PATH = "/public_api/v1/xql/get_query_results"
+
+  DEFAULT_DATASET = "crowdstrike_falcon_spotlight_vulnerabilities_raw"
+  DEFAULT_BATCH_SIZE = 100
+  DEFAULT_XQL_LIMIT = 10000
+  DEFAULT_TIME_FRAME = "7 days"
+  DEFAULT_XQL_TIMEOUT = 120
+
+  DEFAULT_POLL_TIMEOUT = 180
+  DEFAULT_POLL_INTERVAL = 5
+
+  TERMINAL_STATUSES = frozenset({"COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"})
+
+  # BYOS confidence: 'Confirmed' by default (Spotlight actively surfaces the
+  # finding on the asset); 'Potential' when the finding is closed / reopen /
+  # lift_containment (still visible, but not actively active).
+  _CLOSED_STATUSES = {"closed", "lift_containment_pending", "reopen"}
+
+
+  # ---------------------------------------------------------------------------
+  # Cortex API client
+  # ---------------------------------------------------------------------------
+
+  def _cortex_client(base_url: str, api_key: str, api_key_id: str, verify: bool) -> "BaseClient":
+      return BaseClient(
+          base_url=base_url.rstrip("/"),
+          verify=verify,
+          headers={
+              "x-xdr-auth-id": str(api_key_id),
+              "Authorization": api_key,
+              "Content-Type": "application/json",
+              "Accept": "application/json",
+          },
+      )
+
+
+  # ---------------------------------------------------------------------------
+  # XQL query runner
+  # ---------------------------------------------------------------------------
+
+  def _time_frame_to_relative_ms(time_frame: str | None) -> int | None:
+      """Convert '7 days' / '12 hours' to milliseconds. Returns None if invalid."""
+      if not time_frame:
+          return None
+      try:
+          parsed = dateparser.parse(f"in {time_frame}")
+      except Exception:
+          parsed = None
+      if parsed is None:
+          return None
+      if parsed.tzinfo is None:
+          parsed = parsed.replace(tzinfo=timezone.utc)
+      ms = int((parsed - datetime.now(timezone.utc)).total_seconds() * 1000)
+      return max(60_000, ms)
+
+
+  def start_xql_query(client: "BaseClient", query: str, time_frame: str | None) -> str:
+      """Start an XQL query, return the execution_id."""
+      body: dict[str, Any] = {"request_data": {"query": query, "tenants": []}}
+      rel_ms = _time_frame_to_relative_ms(time_frame)
+      if rel_ms is not None:
+          body["request_data"]["timeframe"] = {"relativeTime": rel_ms}
+
+      resp = client._http_request(
+          method="POST",
+          url_suffix=XQL_START_PATH,
+          json_data=body,
+          ok_codes=(200,),
+          timeout=60,
+      )
+      reply = resp.get("reply", resp)
+      # `reply` can be a string (execution_id) or an object with execution_id
+      if isinstance(reply, dict):
+          exec_id = reply.get("execution_id") or reply.get("query_id")
+      else:
+          exec_id = reply
+      if not exec_id:
+          raise DemistoException(f"Failed to start XQL query: {resp}")
+      return str(exec_id)
+
+
+  def wait_for_xql_results(client: "BaseClient", execution_id: str, limit: int,
+                          timeout: int = DEFAULT_XQL_TIMEOUT) -> list[dict]:
+      """
+      Poll get_query_results until SUCCESS / PARTIAL_SUCCESS. Return the row list.
+      """
+      start = time.time()
+      delay = 2
+      while True:
+          resp = client._http_request(
+              method="POST",
+              url_suffix=XQL_RESULTS_PATH,
+              json_data={
+                  "request_data": {
+                      "query_id": execution_id,
+                      "pending_flag": True,
+                      "limit": limit,
+                      "format": "json",
+                  }
+              },
+              ok_codes=(200,),
+              timeout=60,
+          )
+          reply = resp.get("reply", {}) or {}
+          status = str(reply.get("status") or "").upper()
+          if status in ("SUCCESS", "PARTIAL_SUCCESS"):
+              rows = (reply.get("results") or {}).get("data") or []
+              return rows
+          if status in ("FAIL", "CANCELLED", "TIMEOUT"):
+              raise DemistoException(f"XQL query failed: status={status}, reply={reply}")
+          if time.time() - start > timeout:
+              raise DemistoException(
+                  f"XQL query timed out after {timeout}s (last status: {status})"
+              )
+          time.sleep(delay)
+          delay = min(delay * 1.5, 15)
+
+
+  # ---------------------------------------------------------------------------
+  # Payload builders
+  # ---------------------------------------------------------------------------
+
+  def _parse_json_field(value: Any) -> Any:
+      """Safely parse a JSON string, or return the dict/list if already parsed."""
+      if value is None or value == "" or value == "null":
+          return None
+      if isinstance(value, (dict, list)):
+          return value
+      try:
+          return json.loads(value)
+      except (ValueError, TypeError):
+          return None
+
+
+  def _confidence_from_status(status: Any) -> str:
+      return "Potential" if str(status or "").lower() in _CLOSED_STATUSES else "Confirmed"
+
+
+  def build_assets_from_xql_rows(rows: list[dict], now_ts: int) -> list[dict]:
+      """
+      Aggregate XQL rows (one per Spotlight finding) into BYOS asset entries.
+
+      Each row has: aid, cve (JSON), host_info (JSON), remediation (JSON),
+      apps (JSON list), status, updated_timestamp, ...
+      """
+      assets_by_key: dict[str, dict] = {}
+
+      for row in rows:
+          cve = _parse_json_field(row.get("cve")) or {}
+          host_info = _parse_json_field(row.get("host_info")) or {}
+          remediation = _parse_json_field(row.get("remediation")) or {}
+          apps = _parse_json_field(row.get("apps"))
+
+          aid = row.get("aid") or host_info.get("aid")
+          hostname = host_info.get("hostname")
+          if not aid or not hostname:
+              continue
+
+          cve_id = cve.get("id") or cve.get("cve_id")
+          if not cve_id:
+              continue
+
+          if aid not in assets_by_key:
+              groups = host_info.get("groups") or []
+              local_ip = host_info.get("local_ip")
+              tags = [f"crowdstrike:agent_id:{aid}"]
+              tags.extend(f"group:{g.get('name', '?')}" for g in groups if isinstance(g, dict))
+              if host_info.get("site_name"):
+                  tags.append(f"site:{host_info['site_name']}")
+              if host_info.get("platform_name"):
+                  tags.append(f"platform:{host_info['platform_name']}")
+              assets_by_key[aid] = {
+                  "origin_asset_id": f"crowdstrike-agent-{aid}",
+                  "asset_name": hostname,
+                  "fqdn": [hostname],
+                  "ipv4": [local_ip] if local_ip and ":" not in str(local_ip) else [],
+                  "os_name": host_info.get("os_version") or host_info.get("platform_name"),
+                  "vendor": VENDOR,
+                  "product": host_info.get("platform_name") or PRODUCT,
+                  "version": host_info.get("os_build") or "",
+                  "last_seen": now_ts,
+                  "origin_tags": tags,
+                  "vulnerabilities": [],
+              }
+
+          asset = assets_by_key[aid]
+
+          # Build remediation "evidence" text
+          remediation_text = ""
+          if remediation and remediation.get("entities"):
+              entities = remediation.get("entities") or []
+              if entities:
+                  e = entities[0]
+                  remediation_text = (
+                      f"{e.get('action', 'Patch')}: "
+                      f"{e.get('reference') or e.get('title') or ''} "
+                      f"{(e.get('link') or '').strip()}"
+                  ).strip()
+
+          asset["vulnerabilities"].append({
+              "vulnerability_id": cve_id,
+              "cve_id": [cve_id],
+              "description": (cve.get("description") or cve.get("name") or cve_id)[:1024],
+              "confidence": _confidence_from_status(row.get("status")),
+              "last_seen": now_ts,
+              "raw_output": json.dumps({
+                  "cve_base_score": cve.get("base_score"),
+                  "cve_severity": cve.get("severity"),
+                  "cve_exprt_rating": cve.get("exprt_rating"),
+                  "cve_exploit_status": cve.get("exploit_status"),
+                  "cve_cisa_info": cve.get("cisa_info"),
+                  "cve_actors": cve.get("actors"),
+                  "cve_vector": cve.get("vector"),
+                  "cve_published_date": cve.get("published_date"),
+                  "cve_vendor_advisory": cve.get("vendor_advisory"),
+                  "apps": apps,
+                  "spotlight_status": row.get("status"),
+                  "spotlight_finding_id": row.get("id"),
+                  "updated_timestamp_source": row.get("updated_timestamp"),
+              }, default=str)[:4000],
+              "evidence": (remediation_text or f"CrowdStrike Falcon Spotlight detected {cve_id} on {hostname}")[:1024],
+              "scan_name": "CrowdStrike Falcon Spotlight",
+          })
+
+      return list(assets_by_key.values())
+
+
+  # ---------------------------------------------------------------------------
+  # BYOS submit + poll
+  # ---------------------------------------------------------------------------
+
+  def submit_batch(base_url: str, api_key: str, api_key_id: str, verify: bool,
+                   payload: dict) -> dict:
+      client = _cortex_client(base_url, api_key, api_key_id, verify)
+      response = client._http_request(
+          method="POST",
+          url_suffix=BYOS_SUBMIT_PATH,
+          json_data=payload,
+          resp_type="response",
+          ok_codes=(200, 201, 202),
+          timeout=120,
+      )
+      try:
+          return response.json()
+      except Exception:
+          return {"raw": response.text}
+
+
+  def poll_job(base_url: str, api_key: str, api_key_id: str, verify: bool,
+               job_id: str, timeout: int = DEFAULT_POLL_TIMEOUT,
+               interval: int = DEFAULT_POLL_INTERVAL) -> dict:
+      client = _cortex_client(base_url, api_key, api_key_id, verify)
+      start = time.time()
+      delay = max(1, interval)
+      attempts = 0
+      last_body: dict = {"job_id": job_id}
+
+      while True:
+          attempts += 1
+          response = client._http_request(
+              method="GET",
+              url_suffix=f"{BYOS_JOB_PATH}/{job_id}",
+              resp_type="response",
+              ok_codes=(200, 404),
+              timeout=30,
+          )
+          elapsed = int(time.time() - start)
+
+          if response.status_code == 404:
+              return {
+                  "job_id": job_id,
+                  "job_status": "NOT_FOUND",
+                  "error_log": "Job not found by the BYOS API",
+                  "poll_attempts": attempts,
+                  "poll_elapsed_seconds": elapsed,
+              }
+
+          try:
+              last_body = response.json() or {}
+          except Exception:
+              last_body = {"job_id": job_id, "raw": response.text}
+          last_body.setdefault("job_id", job_id)
+
+          status = str(last_body.get("job_status") or "").upper()
+          demisto.debug(f"Poll {job_id} attempt={attempts} elapsed={elapsed}s status={status}")
+
+          if status in TERMINAL_STATUSES:
+              last_body["poll_attempts"] = attempts
+              last_body["poll_elapsed_seconds"] = elapsed
+              return last_body
+
+          if elapsed >= timeout:
+              last_body["poll_timeout_hit"] = True
+              last_body["poll_attempts"] = attempts
+              last_body["poll_elapsed_seconds"] = elapsed
+              return last_body
+
+          remaining = timeout - elapsed
+          time.sleep(min(delay, max(1, remaining)))
+          delay = min(int(delay * 1.5), 30)
+
+
+  def _extract_job_id(response: dict | None) -> str | None:
+      if not response:
+          return None
+      if response.get("job_id"):
+          return response["job_id"]
+      reply = response.get("reply") or {}
+      return reply.get("job_id")
+
+
+  # ---------------------------------------------------------------------------
+  # Standalone poll-only mode
+  # ---------------------------------------------------------------------------
+
+  def _poll_only(args: dict) -> None:
+      api_url = args.get("api_url")
+      api_key = args.get("api_key")
+      api_key_id = args.get("api_key_id")
+      verify = _bool_arg(args.get("verify"), default=True)
+      job_id = str(args.get("poll_job_id")).strip()
+      timeout = int(args.get("poll_timeout") or DEFAULT_POLL_TIMEOUT)
+      interval = int(args.get("poll_interval") or DEFAULT_POLL_INTERVAL)
+
+      if not api_url or not api_key or not api_key_id:
+          raise DemistoException(
+              "'api_url', 'api_key' and 'api_key_id' are required to poll."
+          )
+
+      demisto.info(
+          f"CrowdStrikeBYOSImporter v{SCRIPT_VERSION} poll-only mode: "
+          f"job_id={job_id} timeout={timeout}s interval={interval}s"
+      )
+      result = poll_job(api_url, api_key, api_key_id, verify, job_id, timeout, interval)
+
+      return_results(CommandResults(
+          outputs_prefix="CrowdStrike.BYOS.Poll",
+          outputs_key_field="job_id",
+          outputs=result,
+          readable_output=tableToMarkdown(
+              f"BYOS job poll (importer v{SCRIPT_VERSION})",
+              [{
+                  "job_id": result.get("job_id"),
+                  "job_status": result.get("job_status"),
+                  "created_timestamp": result.get("created_timestamp"),
+                  "last_updated": result.get("last_updated"),
+                  "poll_attempts": result.get("poll_attempts"),
+                  "poll_elapsed_seconds": result.get("poll_elapsed_seconds"),
+                  "error_log": result.get("error_log"),
+              }],
+              ["job_id", "job_status", "created_timestamp", "last_updated",
+               "poll_attempts", "poll_elapsed_seconds", "error_log"],
+          ),
+      ))
+
+
+  # ---------------------------------------------------------------------------
+  # Main
+  # ---------------------------------------------------------------------------
+
+  def _bool_arg(value: Any, default: bool = False) -> bool:
+      if value is None or value == "":
+          return default
+      return str(value).lower() in ("true", "yes", "1")
+
+
+  def _batched(items: list, size: int) -> list[list]:
+      return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+  def _build_xql_query(dataset: str, extra_filter: str | None, limit: int) -> str:
+      where = f"| filter {extra_filter}\n" if extra_filter else ""
+      return (
+          f"dataset = {dataset}\n"
+          f"{where}"
+          "| fields aid, id, cve, host_info, remediation, apps, status, updated_timestamp\n"
+          f"| limit {limit}\n"
+      )
+
+
+  def main():
+      args = demisto.args() or {}
+
+      # Standalone poll mode
+      if args.get("poll_job_id"):
+          _poll_only(args)
+          return
+
+      api_url = args.get("api_url")
+      api_key = args.get("api_key")
+      api_key_id = args.get("api_key_id")
+
+      if not api_url or not api_key or not api_key_id:
+          raise DemistoException(
+              "'api_url', 'api_key' and 'api_key_id' are required (Cortex XSIAM API key + tenant URL)."
+          )
+
+      verify = _bool_arg(args.get("verify"), default=True)
+      batch_size = int(args.get("batch_size") or DEFAULT_BATCH_SIZE)
+      xql_limit = int(args.get("xql_limit") or DEFAULT_XQL_LIMIT)
+      xql_timeout = int(args.get("xql_timeout") or DEFAULT_XQL_TIMEOUT)
+      time_frame = args.get("time_frame") or DEFAULT_TIME_FRAME
+      dataset_name = args.get("dataset") or DEFAULT_DATASET
+      extra_filter = args.get("extra_xql_filter") or ""
+      dry_run = _bool_arg(args.get("dry_run"), default=False)
+      poll_after_submit = _bool_arg(args.get("poll_after_submit"), default=True)
+      poll_timeout = int(args.get("poll_timeout") or DEFAULT_POLL_TIMEOUT)
+      poll_interval = int(args.get("poll_interval") or DEFAULT_POLL_INTERVAL)
+
+      now_ts = int(time.time() * 1000)
+
+      query = _build_xql_query(dataset_name, extra_filter, xql_limit)
+
+      demisto.info(
+          f"CrowdStrikeBYOSImporter version={SCRIPT_VERSION} starting - "
+          f"now_ts={now_ts} (ms) time_frame={time_frame} dataset={dataset_name}"
+      )
+      demisto.info(f"XQL query:\n{query}")
+
+      client = _cortex_client(api_url, api_key, api_key_id, verify)
+      execution_id = start_xql_query(client, query, time_frame)
+      demisto.info(f"XQL execution_id={execution_id}")
+      rows = wait_for_xql_results(client, execution_id, xql_limit, xql_timeout)
+      demisto.info(f"XQL returned {len(rows)} rows")
+
+      if not rows:
+          return_results(CommandResults(
+              outputs_prefix="CrowdStrike.BYOS",
+              outputs={"assets_count": 0, "vulnerabilities_count": 0, "jobs": []},
+              readable_output=f"[v{SCRIPT_VERSION}] No Spotlight rows returned for dataset={dataset_name} time_frame={time_frame}.",
+          ))
+          return
+
+      assets = build_assets_from_xql_rows(rows, now_ts)
+      vuln_count = sum(len(a["vulnerabilities"]) for a in assets)
+
+      demisto.info(
+          f"Prepared {len(assets)} assets / {vuln_count} vulnerabilities "
+          f"from {len(rows)} XQL rows"
+      )
+
+      if not assets:
+          return_results(CommandResults(
+              outputs_prefix="CrowdStrike.BYOS",
+              outputs={
+                  "assets_count": 0,
+                  "vulnerabilities_count": 0,
+                  "xql_rows": len(rows),
+                  "jobs": [],
+              },
+              readable_output=(
+                  f"No assets built from {len(rows)} XQL rows - "
+                  "either host_info was empty or every row was missing a CVE ID."
+              ),
+          ))
+          return
+
+      if dry_run:
+          return_results(CommandResults(
+              outputs_prefix="CrowdStrike.BYOS",
+              outputs={
+                  "assets_count": len(assets),
+                  "vulnerabilities_count": vuln_count,
+                  "xql_rows": len(rows),
+                  "sample_payload": {
+                      "vendor": VENDOR, "product": PRODUCT, "version": VERSION,
+                      "assets": assets[:2],
+                  },
+                  "jobs": [],
+              },
+              readable_output=(
+                  f"[dry_run - importer v{SCRIPT_VERSION}] Would submit {len(assets)} "
+                  f"assets / {vuln_count} vulnerabilities to Cortex XSIAM BYOS in "
+                  f"batches of {batch_size}."
+              ),
+          ))
+          return
+
+      jobs: list[dict] = []
+      for i, batch in enumerate(_batched(assets, batch_size), start=1):
+          batch_vulns = sum(len(a["vulnerabilities"]) for a in batch)
+          payload = {
+              "vendor": VENDOR,
+              "product": PRODUCT,
+              "version": VERSION,
+              "assets": batch,
+          }
+          demisto.info(f"Submitting batch {i}: {len(batch)} assets / {batch_vulns} vulnerabilities")
+          response = submit_batch(api_url, api_key, api_key_id, verify, payload)
+          job_id = _extract_job_id(response)
+          jobs.append({
+              "batch": i,
+              "assets_in_batch": len(batch),
+              "vulnerabilities_in_batch": batch_vulns,
+              "job_id": job_id,
+              "response": response,
+          })
+
+      if poll_after_submit:
+          demisto.info(
+              f"Auto-polling {len(jobs)} job(s) with timeout={poll_timeout}s "
+              f"interval={poll_interval}s"
+          )
+          for j in jobs:
+              if not j.get("job_id"):
+                  j["poll_result"] = {"job_status": "NO_JOB_ID_RETURNED"}
+                  continue
+              j["poll_result"] = poll_job(
+                  api_url, api_key, api_key_id, verify,
+                  j["job_id"], poll_timeout, poll_interval,
+              )
+
+      def _row(j: dict) -> dict:
+          pr = j.get("poll_result") or {}
+          return {
+              "batch": j["batch"],
+              "assets_in_batch": j["assets_in_batch"],
+              "vulnerabilities_in_batch": j["vulnerabilities_in_batch"],
+              "job_id": j.get("job_id"),
+              "job_status": pr.get("job_status") or ("submitted" if not poll_after_submit else "unknown"),
+              "poll_attempts": pr.get("poll_attempts"),
+              "poll_elapsed_seconds": pr.get("poll_elapsed_seconds"),
+              "error_log": pr.get("error_log"),
+          }
+
+      rows_out = [_row(j) for j in jobs]
+      total_ok = sum(1 for r in rows_out if r["job_status"] == "COMPLETED")
+      total_partial = sum(1 for r in rows_out if r["job_status"] == "COMPLETED_WITH_ERRORS")
+      total_failed = sum(1 for r in rows_out if r["job_status"] == "FAILED")
+
+      return_results(CommandResults(
+          outputs_prefix="CrowdStrike.BYOS",
+          outputs={
+              "assets_count": len(assets),
+              "vulnerabilities_count": vuln_count,
+              "xql_rows": len(rows),
+              "jobs": jobs,
+              "poll_summary": {
+                  "polled": poll_after_submit,
+                  "total_jobs": len(jobs),
+                  "completed": total_ok,
+                  "completed_with_errors": total_partial,
+                  "failed": total_failed,
+              },
+          },
+          readable_output=tableToMarkdown(
+              f"CrowdStrike Falcon Spotlight -> Cortex XSIAM BYOS (importer v{SCRIPT_VERSION}, "
+              f"{len(assets)} assets, {vuln_count} vulnerabilities, "
+              f"{len(jobs)} job(s): {total_ok} completed, "
+              f"{total_partial} with errors, {total_failed} failed)",
+              rows_out,
+              ["batch", "assets_in_batch", "vulnerabilities_in_batch", "job_id",
+               "job_status", "poll_attempts", "poll_elapsed_seconds", "error_log"],
+          ),
+      ))
+
+
+  if __name__ in ("__main__", "__builtin__", "builtins"):
+      main()
+scripttarget: 0
+signature: ''
+subtype: python3
+tags: []
+type: python
